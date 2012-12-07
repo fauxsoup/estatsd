@@ -11,7 +11,7 @@ QUICK DEMO
 
 1) Install and configure graphite (quick-ish)
 2) Install rebar, have it in your path
-3) rebar compile
+3) rebar get-deps; rebar compile; rebar generate
 4) erl -pa ebin
 5) > application:start(estatsd).
    > estatsd:increment(foo, 123).
