@@ -31,10 +31,7 @@
         enable_node_tagging = false,
         node_tagging        = [],
         cluster_tagging     = [],
-        vm_metrics          = true,             % flag to enable sending VM metrics on flush
-        stats_tables        = undefined,        % Evantually a tuple with two Tids for stats
-        gauge_tables        = undefined,        % Eventually a tuple with two Tids for gauges
-        timer_tables        = undefined         % Eventually a tuple with two Tids for timers
+        vm_metrics          = true              % flag to enable sending VM metrics on flush
     }).
 
 start_link() ->
@@ -50,37 +47,20 @@ init([]) ->
     % 1. Initialize our state.
     State = #state{flush_interval = FlushInterval} = init_state(),
 
-    % 2. Create a table to hold the current table to use. Optimize for read operations,
-    % as we'll only be writing once every FlushIntervalMs
-    ets:new(statsd, [named_table, set, public, {read_concurrency, true}]),
-
     % 3. Create two tables each for gauges and counters; double-buffer mentality :)
     % Use duplicate bags to accomodate multiple entries for each key in gauge and timer tables
     % Optimize for write operations
-    ets:new(statsd_counters_agg, [named_table, set, public, {write_concurrency, true}]),
-    ets:new(statsd_gauge_agg, [named_table, set, public, {write_concurrency, true}]),
-    ets:new(statsd_timer_agg, [named_table, duplicate_bag, public, {write_concurrency, true}]),
-    TidStatsA   = ets:new(statsd_counters_a, [set, public, {write_concurrency, true}]),
-    TidStatsB   = ets:new(statsd_counters_b, [set, public, {write_concurrency, true}]),
-    TidGaugeA   = ets:new(statsd_gauge_a, [duplicate_bag, public, {write_concurrency, true}]),
-    TidGaugeB   = ets:new(statsd_gauge_b, [duplicate_bag, public, {write_concurrency, true}]),
-    TidTimerA   = ets:new(statsd_timer_a, [duplicate_bag, public, {write_concurrency, true}]),
-    TidTimerB   = ets:new(statsd_timer_b, [duplicate_bag, public, {write_concurrency, true}]),
-
-    % 4. Indicate which tables are currently our "write" buffers
-    ets:insert(statsd, {stats, TidStatsA}),
-    ets:insert(statsd, {gauge, TidGaugeA}),
-    ets:insert(statsd, {timer, TidTimerA}),
+    neural:new(statsd_counters_agg, []),
+    neural:new(statsd_gauge_agg, []),
+    neural:new(statsd_timer_agg, []),
+    neural:new(statsd_counter, []),
+    neural:new(statsd_gauge, []),
+    neural:new(statsd_timer, []),
 
     % 5. Set a timer to flush stats
     {ok, Tref} = timer:apply_interval(FlushInterval, gen_leader, cast, [?MODULE, flush]),
 
-    {ok, State#state{
-            flush_timer     = Tref,
-            stats_tables    = {TidStatsA, TidStatsB},   % See? I told you they'd be tuples with two Tids
-            gauge_tables    = {TidGaugeA, TidGaugeB},
-            timer_tables    = {TidTimerA, TidTimerB}
-        }}.
+    {ok, State#state{flush_timer = Tref}}.
 
 init_state() ->
     NodeTagging     = parse_tagging(estatsd_utils:appvar(node_tagging, [])),
@@ -111,52 +91,36 @@ elected(State, _Election, _Node) ->
     {reply, [], State}.
 
 surrendered(State = #state{aggregate = VMs}, _Sync, _Election) ->
-    Counters    = ets:tab2list(statsd_counters_agg),
-    Gauges      = ets:tab2list(statsd_gauge_agg),
-    Timers      = ets:tab2list(statsd_timer_agg),
+    Counters    = neural:drain(statsd_counters_agg),
+    Gauges      = neural:drain(statsd_gauge_agg),
+    Timers      = neural:drain(statsd_timer_agg),
 
     estatsd:aggregate(Counters, Gauges, Timers, VMs),
 
     {ok, State#state{is_leader = false, aggregate = []}}.
 
-handle_cast(flush, State = #state{aggregate = Aggregate, stats_tables = {CurrentStats, NewStats}, gauge_tables = {CurrentGauge, NewGauge}, timer_tables = {CurrentTimer, NewTimer}}, _Election) ->
-    % 1. Flip tables externally
-    ets:insert(statsd, [{stats, NewStats}, {gauge, NewGauge}, {timer, NewTimer}]),
-
-    % 2. Sleep for a little bit to allow pending operations to finish
-    timer:sleep(100),
-
+handle_cast(flush, State = #state{aggregate = Aggregate}, _Election) ->
     % 3. Gather data
-    All     = get_counters(CurrentStats, State),
-    Gauges  = get_gauges(CurrentGauge, State),
-    Timers  = get_timers(CurrentTimer, State), % Timers are a duplicate bag
+    All     = get_counters(State),
+    Gauges  = get_gauges(State),
+    Timers  = get_timers(State), % Timers are a duplicate bag
     VM      = get_vm_metrics(Aggregate, State),
 
     % 4. Do reports
     CurrTime = os:timestamp(),
     do_report(All, Timers, Gauges, VM, CurrTime, State),
 
-    % 5. Clear our back-buffers
-    ets:delete_all_objects(CurrentStats),
-    ets:delete_all_objects(CurrentGauge),
-    ets:delete_all_objects(CurrentTimer),
-
     % 6. Update state to flip tables internally
     NewState = State#state{
         last_flush      = CurrTime,                     % Also, update the last flush so our calculations are, you know, accurate.
-        aggregate       = [],
-        stats_tables    = {NewStats, CurrentStats}, 
-        gauge_tables    = {NewGauge, CurrentGauge}, 
-        timer_tables    = {NewTimer, CurrentTimer}
+        aggregate       = []
     },
     {noreply, NewState}.
 
 handle_leader_cast({aggregate, Counters, Timers, Gauges, VMs}, State = #state{aggregate = Aggregate}, _Election) ->
-    lists:foreach(fun({K, V}) -> estatsd_utils:ets_incr(statsd_counters_agg, K, V) end, Counters),
-    lists:foreach(fun(Gauge) -> ets:insert(statsd_gauge_agg, Gauge) end, Gauges),
-    CurrentTimers = ets:tab2list(statsd_timer_agg),
-    UpdatedTimers = lists:foldl(fun merge_accumulation/2, CurrentTimers, Timers),
-    lists:foreach(fun(Timer) -> ets:insert(statsd_timer_agg, Timer) end, UpdatedTimers),
+    lists:foreach(fun({K, V}) -> estatsd_utils:do_incr(statsd_counters_agg, K, V) end, Counters),
+    lists:foreach(fun({K, V}) -> estatsd_utils:do_push(statsd_gauge_agg, K, V) end, Gauges),
+    lists:foreach(fun({K, V}) -> estatsd_utils:do_push(statsd_timer_agg, K, V) end, Timers),
     {noreply, State#state{aggregate = Aggregate ++ VMs}};
 handle_leader_cast(_Cast, State, _Election) ->
     {noreply, State}.
@@ -183,48 +147,38 @@ terminate(_, _) ->
     ok.
 
 %% INTERNAL STUFF
-get_counters(Tid, _State = #state{is_leader = false, enable_node_tagging = false}) ->
-    [ {key2str(K),V} || {K,V} <- ets:tab2list(Tid) ];
-get_counters(Tid, _State = #state{is_leader = false, enable_node_tagging = true, node_tagging = []}) ->
-    [ {key2str(K),V} || {K,V} <- ets:tab2list(Tid) ];
-get_counters(Tid, _State = #state{is_leader = false, enable_node_tagging = true, node_tagging = NodeTagging}) ->
-    tag_metrics(ets:tab2list(Tid), NodeTagging);
-get_counters(Tid, State = #state{is_leader = true}) ->
-    LocalCounters = get_counters(Tid, State#state{is_leader = false}),
-    lists:foreach(fun({K, V}) -> estatsd_utils:ets_incr(statsd_counters_agg, K, V) end, LocalCounters),
-    Counters = ets:tab2list(statsd_counters_agg),
-    ets:delete_all_objects(statsd_counters_agg),
-    Counters.
+get_counters(_State = #state{is_leader = false, enable_node_tagging = false}) ->
+    [ {key2str(K),V} || {K,V} <- neural:drain(statsd_counter) ];
+get_counters(_State = #state{is_leader = false, enable_node_tagging = true, node_tagging = []}) ->
+    [ {key2str(K),V} || {K,V} <- neural:drain(statsd_counter) ];
+get_counters(_State = #state{is_leader = false, enable_node_tagging = true, node_tagging = NodeTagging}) ->
+    tag_metrics(neural:drain(statsd_counter), NodeTagging);
+get_counters(State = #state{is_leader = true}) ->
+    LocalCounters = get_counters(State#state{is_leader = false}),
+    lists:foreach(fun({K, V}) -> estatsd_utils:do_incr(statsd_counters_agg, K, V) end, LocalCounters),
+    neural:drain(statsd_counters_agg).
 
-get_timers(Tid, _State = #state{is_leader = false, enable_node_tagging = false}) ->
-    [ {key2str(K),V} || {K,V} <- accumulate(ets:tab2list(Tid)) ];
-get_timers(Tid, _State = #state{is_leader = false, enable_node_tagging = true, node_tagging = []}) ->
-    [ {key2str(K),V} || {K,V} <- accumulate(ets:tab2list(Tid)) ];
-get_timers(Tid, _State = #state{is_leader = false, enable_node_tagging = true, node_tagging = NodeTagging}) ->
-    tag_metrics(accumulate(ets:tab2list(Tid)), NodeTagging);
-get_timers(Tid, State = #state{is_leader = true}) ->
-    LocalTimers = get_timers(Tid, State#state{is_leader = false}),
-    Timers = ets:tab2list(statsd_timer_agg),
-    ets:delete_all_objects(statsd_timer_agg),
-    lists:foldl(fun merge_accumulation/2, Timers, LocalTimers).
+get_timers(_State = #state{is_leader = false, enable_node_tagging = false}) ->
+    [ {key2str(K),V} || {K,V} <- neural:drain(statsd_timer) ];
+get_timers(_State = #state{is_leader = false, enable_node_tagging = true, node_tagging = []}) ->
+    [ {key2str(K),V} || {K,V} <- neural:drain(statsd_timer) ];
+get_timers(_State = #state{is_leader = false, enable_node_tagging = true, node_tagging = NodeTagging}) ->
+    tag_metrics(neural:drain(statsd_timer), NodeTagging);
+get_timers(State = #state{is_leader = true}) ->
+    LocalTimers = get_timers(State#state{is_leader = false}),
+    lists:foreach(fun({K, V}) -> estatsd_utils:do_push(statsd_timer_agg, K, V) end, LocalTimers),
+    neural:drain(statsd_timer_agg).
     
-merge_accumulation({K, Values}, Acc) ->
-    case lists:keyfind(K, 1, Acc) of
-        false -> [{K, Values}|Acc];
-        {K, OldValues} -> lists:keystore(K, 1, Acc, {K, OldValues ++ Values})
-    end.
-
-get_gauges(Tid, _State = #state{is_leader = false, enable_node_tagging = false}) ->
-    [ {key2str(K), V} || {K,V} <- accumulate(ets:tab2list(Tid)) ];
-get_gauges(Tid, _State = #state{is_leader = false, enable_node_tagging = true, node_tagging = []}) ->
-    [ {key2str(K), V} || {K,V} <- accumulate(ets:tab2list(Tid)) ];
-get_gauges(Tid, _State = #state{is_leader = false, enable_node_tagging = true, node_tagging = NodeTagging}) ->
-    tag_metrics(accumulate(ets:tab2list(Tid)), NodeTagging);
-get_gauges(Tid, State = #state{is_leader = true}) ->
-    LocalGauges = get_gauges(Tid, State#state{is_leader = false}),
-    Gauges = accumulate(ets:tab2list(statsd_gauge_agg)),
-    ets:delete_all_objects(statsd_gauge_agg),
-    lists:foldl(fun merge_accumulation/2, Gauges, LocalGauges).
+get_gauges(_State = #state{is_leader = false, enable_node_tagging = false}) ->
+    [ {key2str(K), V} || {K,V} <- neural:drain(statsd_gauge) ];
+get_gauges(_State = #state{is_leader = false, enable_node_tagging = true, node_tagging = []}) ->
+    [ {key2str(K), V} || {K,V} <- neural:drain(statsd_gauge) ];
+get_gauges(_State = #state{is_leader = false, enable_node_tagging = true, node_tagging = NodeTagging}) ->
+    tag_metrics(neural:drain(statsd_gauge), NodeTagging);
+get_gauges(State = #state{is_leader = true}) ->
+    LocalGauges = get_gauges(State#state{is_leader = false}),
+    lists:foreach(fun({K, V}) -> estatsd_utils:do_push(statsd_gauge_agg, K, V) end, LocalGauges),
+    neural:drain(statsd_gauge_agg).
 
 %% Don't apply node tagging rules for VM stats. They are not
 %% user-generated keys.
@@ -253,17 +207,6 @@ get_local_metrics() ->
                 ],
     MemoryData = erlang:memory(),
     {StatsData, MemoryData}.
-
-accumulate(List) ->
-    lists:foldl(fun do_accumulate/2, [], List).
-
-do_accumulate({Key, Value}, L) ->
-    case lists:keyfind(Key, 1, L) of
-        false -> 
-            [{Key, [Value]}|L];
-        {Key, Values} ->
-            lists:keystore(Key, 1, L, {Key, [Value|Values]})
-    end.
 
 send_to_graphite(Msg, GraphiteHost, GraphitePort) ->
     case gen_tcp:connect(GraphiteHost, GraphitePort, [list, {packet, 0}]) of

@@ -30,8 +30,7 @@ timing(Key, StartTime = {_,_,_}) ->
     timing(Key,Dur);
 
 timing(Key, Duration) when is_integer(Duration) -> 
-    Tid = get_table(timer),
-    ets:insert(Tid, {Key, Duration});
+    estatsd_utils:do_push(statsd_timer, Key, [Duration]);
 timing(Key, Duration) -> 
     timing(Key, round(Duration)).
 
@@ -85,15 +84,6 @@ timing_call(Key, M, F, A, _) ->
     timing(Key, Duration / 1000),
     Res.
 
-%% @doc Find the specified table's Tid in the settings
-%% table, or, failing that, crash and burn.
--spec get_table(atom()) -> term().
-get_table(Table) ->
-    case ets:lookup(statsd, Table) of
-        [{_, Tid}] -> Tid;
-        [] -> throw({no_exists, Table})
-    end.
-
 %% @doc Increments the specified key by 1
 -spec increment(Key :: atom() | string()) -> integer() | ok.
 increment(Key) -> increment(Key, 1, 1).
@@ -114,8 +104,7 @@ increment(Key, Amount, Sample) when Sample < 1 ->
             ok
     end;
 increment(Key, Amount, _Sample) ->
-    Tid = get_table(stats),
-    estatsd_utils:ets_incr(Tid, Key, Amount).
+    estatsd_utils:do_incr(statsd_counter, Key, Amount).
 
 %% @doc Decrements the specified key by 1.
 -spec decrement(Key :: atom() | string()) -> integer() | ok.
@@ -135,6 +124,5 @@ decrement(Key, Amount, Sample) ->
 %% @doc Adds a reading to the gauge table with the specified key.
 -spec gauge(Key :: atom() | string(), Value :: number()) -> true.
 gauge(Key, Value) when is_number(Value) ->
-    Tid = get_table(gauge),
     TS = estatsd_utils:unixtime(),
-    ets:insert(Tid, {Key, {Value, TS}}).
+    estatsd_utils:do_push(statsd_gauge, Key, [{Value, TS}]).
