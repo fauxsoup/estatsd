@@ -149,6 +149,7 @@ handle_cast(flush, State = #state{aggregate = Aggregate, stats_tables = {Current
         gauge_tables    = {NewGauge, CurrentGauge}, 
         timer_tables    = {NewTimer, CurrentTimer}
     },
+    erlang:garbage_collect(),
     {noreply, NewState}.
 
 handle_leader_cast({aggregate, Counters, Timers, Gauges, VMs}, State = #state{aggregate = Aggregate}, _Election) ->
