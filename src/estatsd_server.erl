@@ -126,6 +126,8 @@ handle_cast(flush, State = #state{aggregate = Aggregate, stats_tables = {Current
     % 2. Sleep for a little bit to allow pending operations to finish
     timer:sleep(100),
 
+    TStart = os:timestamp(),
+
     % 3. Gather data
     All     = get_counters(CurrentStats, State),
     Gauges  = get_gauges(CurrentGauge, State),
@@ -150,6 +152,9 @@ handle_cast(flush, State = #state{aggregate = Aggregate, stats_tables = {Current
         timer_tables    = {NewTimer, CurrentTimer}
     },
     erlang:garbage_collect(),
+
+    TStop = os:timestamp(),
+    error_logger:error_msg("Flush Duration: ~pus", [timer:now_diff(TStop, TStart)]),
     {noreply, NewState}.
 
 handle_leader_cast({aggregate, Counters, Timers, Gauges, VMs}, State = #state{aggregate = Aggregate}, _Election) ->
