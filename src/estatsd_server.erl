@@ -126,23 +126,26 @@ handle_cast(flush, State = #state{aggregate = Aggregate, stats_tables = {Current
     % 2. Sleep for a little bit to allow pending operations to finish
     timer:sleep(100),
 
-    TStart = os:timestamp(),
-
-    % 3. Gather data
-    All     = get_counters(CurrentStats, State),
-    Gauges  = get_gauges(CurrentGauge, State),
-    Timers  = get_timers(CurrentTimer, State), % Timers are a duplicate bag
-    VM      = get_vm_metrics(Aggregate, State),
-
-    % 4. Do reports
     CurrTime = os:timestamp(),
-    do_report(All, Timers, Gauges, VM, CurrTime, State),
+    spawn(fun() ->
+        % 3. Gather data
+        All     = get_counters(CurrentStats, State),
+        Gauges  = get_gauges(CurrentGauge, State),
+        Timers  = get_timers(CurrentTimer, State), % Timers are a duplicate bag
+        VM      = get_vm_metrics(Aggregate, State),
+    
+        % 4. Do reports
+        do_report(All, Timers, Gauges, VM, CurrTime, State),
+    
+        % 5. Clear our back-buffers
+        ets:delete_all_objects(CurrentStats),
+        ets:delete_all_objects(CurrentGauge),
+        ets:delete_all_objects(CurrentTimer),
 
-    % 5. Clear our back-buffers
-    ets:delete_all_objects(CurrentStats),
-    ets:delete_all_objects(CurrentGauge),
-    ets:delete_all_objects(CurrentTimer),
-
+        TStop = os:timestamp(),
+        error_logger:error_msg("Flush Duration: ~pus", [timer:now_diff(TStop, CurrTime)])
+    end),
+    
     % 6. Update state to flip tables internally
     NewState = State#state{
         last_flush      = CurrTime,                     % Also, update the last flush so our calculations are, you know, accurate.
@@ -151,10 +154,7 @@ handle_cast(flush, State = #state{aggregate = Aggregate, stats_tables = {Current
         gauge_tables    = {NewGauge, CurrentGauge}, 
         timer_tables    = {NewTimer, CurrentTimer}
     },
-    erlang:garbage_collect(),
 
-    TStop = os:timestamp(),
-    error_logger:error_msg("Flush Duration: ~pus", [timer:now_diff(TStop, TStart)]),
     {noreply, NewState}.
 
 handle_leader_cast({aggregate, Counters, Timers, Gauges, VMs}, State = #state{aggregate = Aggregate}, _Election) ->
