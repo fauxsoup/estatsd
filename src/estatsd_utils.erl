@@ -46,7 +46,7 @@ increment_new(Tid, Key, Amount) ->
 unixtime() -> unixtime(os:timestamp()).
 unixtime({M, S, _}) -> (M * 1000000) + S.
 
-num_to_str(NN) -> lists:flatten(io_lib:format("~w",[NN])).
+num_to_str(NN) -> iolist_to_binary(io_lib:format("~w",[NN])).
 
 bin_to_hash(Bin) when is_binary(Bin) ->
     bin_to_hash(Bin, []).

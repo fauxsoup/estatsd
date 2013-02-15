@@ -26,6 +26,7 @@
         last_flush          = os:timestamp(),   % erlang-style timestamp of last flush (or start time)
         flush_timer         = undefined,        % TRef of interval timer
         destination         = undefined,        % What to do every flush interval
+        socket              = undefined,
         is_leader           = false,
         aggregate           = [],
         enable_node_tagging = false,
@@ -42,7 +43,7 @@ start_link() ->
         undefined -> [node()];
         {ok, Peers} -> Peers
     end,
-    gen_leader:start_link(?MODULE, Nodes, [], ?MODULE, [], [{spawn_opt, [{priority, high}]}]).
+    gen_leader:start_link(?MODULE, Nodes, [], ?MODULE, [], []).
 
 %%
 
@@ -85,9 +86,12 @@ init([]) ->
 init_state() ->
     NodeTagging     = parse_tagging(estatsd_utils:appvar(node_tagging, [])),
     ClusterTagging  = parse_tagging(estatsd_utils:appvar(cluster_tagging, [])),
+    Destination     = estatsd_utils:appvar(destination,  {graphite, "127.0.0.1", 2003}),
+    {ok, Socket}    = get_socket(Destination),
     #state{ 
         flush_interval      = estatsd_utils:appvar(flush_interval, 10000),
-        destination         = estatsd_utils:appvar(destination,  {graphite, "127.0.0.1", 2003}),
+        destination         = Destination,
+        socket              = Socket,
         vm_metrics          = estatsd_utils:appvar(vm_metrics,  false),
         enable_node_tagging = estatsd_utils:appvar(enable_node_tagging, false),
         node_tagging        = NodeTagging,
@@ -127,24 +131,30 @@ handle_cast(flush, State = #state{aggregate = Aggregate, stats_tables = {Current
     timer:sleep(100),
 
     CurrTime = os:timestamp(),
-    spawn(fun() ->
-        % 3. Gather data
-        All     = get_counters(CurrentStats, State),
-        Gauges  = get_gauges(CurrentGauge, State),
-        Timers  = get_timers(CurrentTimer, State), % Timers are a duplicate bag
-        VM      = get_vm_metrics(Aggregate, State),
-    
-        % 4. Do reports
-        do_report(All, Timers, Gauges, VM, CurrTime, State),
-    
-        % 5. Clear our back-buffers
-        ets:delete_all_objects(CurrentStats),
-        ets:delete_all_objects(CurrentGauge),
-        ets:delete_all_objects(CurrentTimer),
+    % 3. Gather data
+    All     = get_counters(CurrentStats, State),
+    Gauges  = get_gauges(CurrentGauge, State),
+    Timers  = get_timers(CurrentTimer, State), % Timers are a duplicate bag
+    VM      = get_vm_metrics(Aggregate, State),
 
-        TStop = os:timestamp(),
-        error_logger:error_msg("Flush Duration: ~pus", [timer:now_diff(TStop, CurrTime)])
-    end),
+    StatsCollected = os:timestamp(),
+    
+    % 4. Do reports
+    spawn(fun() -> do_report(All, Timers, Gauges, VM, CurrTime, State) end),
+
+    Reported = os:timestamp(),
+    
+    % 5. Clear our back-buffers
+    ets:delete_all_objects(CurrentStats),
+    ets:delete_all_objects(CurrentGauge),
+    ets:delete_all_objects(CurrentTimer),
+
+    TStop = os:timestamp(),
+    Collect = timer:now_diff(StatsCollected, CurrTime), 
+    Report = timer:now_diff(Reported, StatsCollected),
+    Delete = timer:now_diff(TStop, Reported),
+    Total = timer:now_diff(TStop, CurrTime),
+    error_logger:error_msg("Flush Duration: ~pus; Collect: ~pus; Report: ~pus; Delete: ~pus", [Total, Collect, Report, Delete]),
     
     % 6. Update state to flip tables internally
     NewState = State#state{
@@ -155,6 +165,7 @@ handle_cast(flush, State = #state{aggregate = Aggregate, stats_tables = {Current
         timer_tables    = {NewTimer, CurrentTimer}
     },
 
+    erlang:garbage_collect(),
     {noreply, NewState}.
 
 handle_leader_cast({aggregate, Counters, Timers, Gauges, VMs}, State = #state{aggregate = Aggregate}, _Election) ->
@@ -173,6 +184,9 @@ handle_call(_Call,_,State, _Election) ->
 handle_leader_call(_Call, _From, State, _Election) ->
     {reply, ok, State}.
 
+handle_info({tcp_closed, Socket}, State = #state{destination = Destination, socket = Socket}) ->
+    {ok, NewSocket} = get_socket(Destination),
+    {noreply, State#state{socket = NewSocket}};
 handle_info(_Msg, State) -> 
     {noreply, State}.
 
@@ -271,24 +285,17 @@ do_accumulate({Key, Value}, L) ->
             lists:keystore(Key, 1, L, {Key, [Value|Values]})
     end.
 
-send_to_graphite(Msg, GraphiteHost, GraphitePort) ->
-    case gen_tcp:connect(GraphiteHost, GraphitePort, [list, {packet, 0}]) of
-        {ok, Sock} ->
-            gen_tcp:send(Sock, Msg),
-            gen_tcp:close(Sock),
-            ok;
-        E ->
-%            error_logger:error_msg("Failed to connect to graphite: ~p", [E]),
-            E
-    end.
+send_to_graphite(Msg, Socket) ->
+    gen_tcp:send(Socket, Msg).
+
+get_socket({_, Host, Port}) ->
+    gen_tcp:connect(Host, Port, [binary, {packet, 0}, {active, true}]).
 
 % this string munging is damn ugly compared to javascript :(
 key2str(K) when is_atom(K) -> 
-    atom_to_list(K);
-key2str(K) when is_binary(K) -> 
-    key2str(binary_to_list(K));
-key2str(K) when is_list(K) ->
-    Opts = [global, {return, list}],
+    list_to_binary(atom_to_list(K));
+key2str(K) when is_list(K); is_binary(K) ->
+    Opts = [global, {return, binary}],
     lists:foldl(fun({Rx, Replace}, S) -> re:replace(S, Rx, Replace, Opts) end, K, [
             {?COMPILE_ONCE("\\s+"), "_"},
             {?COMPILE_ONCE("/"), "-"},
@@ -298,17 +305,18 @@ key2str(K) when is_list(K) ->
 do_report(All, Timers, Gauges, VM, CurrTime, State = #state{is_leader = true, cluster_tagging = ClusterTagging = [_|_]}) ->
     {All1, Timers1, Gauges1} = tag_metrics({All, Timers, Gauges}, ClusterTagging),
     do_report(All1, Timers1, Gauges1, VM, CurrTime, State#state{cluster_tagging = []});
-do_report(All, Timers, Gauges, VM, CurrTime, State = #state{is_leader = true, destination = {graphite, GraphiteHost, GraphitePort}}) ->
+do_report(All, Timers, Gauges, VM, CurrTime, State = #state{is_leader = true, destination = {graphite, _GraphiteHost, _GraphitePort}, socket = Socket}) ->
     % One time stamp string used in all stats lines:
     Duration                        = timer:now_diff(CurrTime, State#state.last_flush) / 1000000,
     TsStr                           = estatsd_utils:num_to_str(estatsd_utils:unixtime(CurrTime)),
-    {MsgCounters, NumCounters}      = do_report_counters(TsStr, All, Duration),
-    {MsgTimers, NumTimers}          = do_report_timers(TsStr, Timers),
-    {MsgGauges, NumGauges}          = do_report_gauges(Gauges),
-    {MsgVmMetrics, NumVmMetrics}    = do_report_vm_metrics(VM, TsStr, State),
+    {CountDur, {MsgCounters, NumCounters}}     = timer:tc(fun() -> do_report_counters(TsStr, All, Duration) end),
+    {TimeDur, {MsgTimers, NumTimers}}          = timer:tc(fun() -> do_report_timers(TsStr, Timers) end),
+    {GaugeDur, {MsgGauges, NumGauges}}          = timer:tc(fun() -> do_report_gauges(Gauges) end),
+    {VMDur, {MsgVmMetrics, NumVmMetrics}}    = timer:tc(fun() -> do_report_vm_metrics(VM, TsStr, State) end),
     %% REPORT TO GRAPHITE
     case NumTimers + NumCounters + NumGauges + NumVmMetrics of
         0 -> 
+            error_logger:error_msg("Nothing to report. Durations: C: ~p; T: ~p; G: ~p; VM: ~p", [CountDur, TimeDur, GaugeDur, VMDur]),
             nothing_to_report;
         NumStats ->
             FinalMsg = [ MsgCounters,
@@ -318,11 +326,12 @@ do_report(All, Timers, Gauges, VM, CurrTime, State = #state{is_leader = true, de
                          %% Also graph the number of graphs we're graphing:
                          "statsd.num_stats ", estatsd_utils:num_to_str(NumStats), " ", TsStr, "\n"
                        ],
-            send_to_graphite(FinalMsg, GraphiteHost, GraphitePort)
+            {SendDur, _} = timer:tc(fun() -> send_to_graphite(FinalMsg, Socket) end),
+            error_logger:error_msg("Reported ~p stats. Durations: C: ~p; T: ~p; G: ~p; VM: ~p; Send: ~p", [NumStats, CountDur, TimeDur, GaugeDur, VMDur, SendDur])
     end;
 %% TODO: Make everything below this point less atrocious.
-do_report(All, Timers, Gauges, VM, _CurrTime, _State = #state{is_leader = true, destination = Destination}) ->
-    estatsd_tcp:send(Destination, All, Timers, Gauges, VM);
+do_report(All, Timers, Gauges, VM, _CurrTime, _State = #state{is_leader = true, destination = Destination, socket = Socket}) ->
+    estatsd_tcp:send(Destination, Socket, All, Timers, Gauges, VM);
 do_report(All, Timers, Gauges, VM, _CurrTime, _State = #state{is_leader = false}) ->
     estatsd:aggregate(All, Timers, Gauges, VM).
 
@@ -353,26 +362,22 @@ affix(Key, suffix, Affix) ->
     key2str([Key, ".", Affix]).
 
 do_report_counters(TsStr, All, Duration) ->
-    Msg = lists:foldl(
-                fun({Key, Val0}, Acc) ->
+    {Msg, Count} = lists:foldl(
+                fun({Key, Val0}, {Acc, N}) ->
                         KeyS = key2str(Key),
                         Val = Val0 / Duration,
-                        %% Build stats string for graphite
-                        Fragment = [ "stats.", KeyS, " ", 
-                                     io_lib:format("~w", [Val]), " ", 
-                                     TsStr, "\n",
 
-                                     "stats_counts.", KeyS, " ", 
-                                     io_lib:format("~w",[Val0]), " ", 
-                                     TsStr, "\n"
-                                   ],
-                        [ Fragment | Acc ]                    
-                end, [], All),
-    {Msg, length(All)}.
+                        BVal = estatsd_utils:num_to_str(Val),
+                        BVal0 = estatsd_utils:num_to_str(Val0),
+                        %% Build stats string for graphite
+                        Fragment = <<"stats.", KeyS/binary, " ", BVal/binary, " ", TsStr/binary, "\nstats_counts.", KeyS/binary, " ",  BVal0/binary, " ", TsStr/binary, "\n">>,
+                        {<<Acc/binary, Fragment/binary>>, N + 1}
+                end, {<<>>, 0}, All),
+    {Msg, Count}.
 
 do_report_timers(TsStr, Timings) ->
-    Msg = lists:foldl(
-        fun({Key, Vals}, Acc) ->
+    {Msg, Count} = lists:foldl(
+        fun({Key, Vals}, {Acc, N}) ->
                 KeyS = key2str(Key),
                 Values          = lists:sort(Vals),
                 Count           = length(Values),
@@ -385,70 +390,73 @@ do_report_timers(TsStr, Timings) ->
                 MaxAtThreshold  = lists:nth(NumInThreshold, Values),
                 Mean            = lists:sum(Values1) / case NumInThreshold of 0 -> 1; _ -> NumInThreshold end,
                 %% Build stats string for graphite
-                Startl          = [ "stats.timers.", KeyS, "." ],
-                Endl            = [" ", TsStr, "\n"],
-                Fragment        = [ [Startl, Name, " ", estatsd_utils:num_to_str(Val), Endl] || {Name,Val} <-
-                                  [ {"mean", Mean},
-                                    {"upper", Max},
-                                    {"upper_"++estatsd_utils:num_to_str(PctThreshold), MaxAtThreshold},
-                                    {"lower", Min},
-                                    {"count", Count}
-                                  ]],
-                [ Fragment | Acc ]
-        end, [], Timings),
-    {Msg, length(Msg)}.
+                Startl          = << "stats.timers.", KeyS/binary, ".">>,
+                Endl            = <<" ", TsStr/binary, "\n">>,
+                BPctThreshold   = estatsd_utils:num_to_str(PctThreshold),
+                {Fragment, C}   = lists:foldl(fun({Name, Val}, {SubAcc, SubN}) -> 
+                                        Frag = <<Startl/binary, Name/binary, " ", Val/binary, Endl/binary>>, 
+                                        {<<SubAcc/binary, Frag/binary>>, SubN + 1}
+                                    end, {<<>>, 0}, [
+                                        {<<"mean">>, estatsd_utils:num_to_str(Mean)},
+                                        {<<"upper">>, estatsd_utils:num_to_str(Max)},
+                                        {<<"upper_", BPctThreshold/binary>>, estatsd_utils:num_to_str(MaxAtThreshold)},
+                                        {<<"lower">>, estatsd_utils:num_to_str(Min)},
+                                        {<<"count">>, estatsd_utils:num_to_str(Count)}
+                                ]),
+                        {<<Acc/binary, Fragment/binary>>, N + C}
+        end, {<<>>, 0}, Timings),
+    {Msg, Count}.
 
 do_report_gauges(Gauges) ->
-    Msg = lists:foldl(
-        fun({Key, Vals}, Acc) ->
+    {Msg, Count} = lists:foldl(
+        fun({Key, Vals}, {Acc, N}) ->
             KeyS = key2str(Key),
             Fragments = lists:foldl(
                 fun ({Val, TS}, KeyAcc) ->
                     %% Build stats string for graphite
-                    Fragment = [
-                        "stats.gauges.", KeyS, " ",
-                        io_lib:format("~w", [Val]), " ",
-                        integer_to_list(TS), "\n"
-                    ],
-                    [ Fragment | KeyAcc ]
-                end, [], Vals
+                    BVal = estatsd_utils:num_to_str(Val),
+                    BTS = estatsd_utils:num_to_str(TS),
+                    Fragment = <<
+                        "stats.gauges.", KeyS/binary, " ",
+                        BVal/binary, " ",
+                        BTS/binary, "\n"
+                    >>,
+                    <<KeyAcc/binary, Fragment/binary>>
+                end, <<>>, Vals
             ),
-            [ Fragments | Acc ]
-        end, [], Gauges
+            {<<Acc/binary, Fragments/binary>>, N + 1}
+        end, {<<>>, 0}, Gauges
     ),
-    {Msg, length(Gauges)}.
+    {Msg, Count}.
 
 do_report_vm_metrics(VMs, TsStr, State) ->
     case State#state.vm_metrics of
         true ->
-            {TsStr, Msg, C} = lists:foldl(fun build_vm_stats/2, {TsStr, [], 0}, VMs),
+            {TsStr, Msg, C} = lists:foldl(fun build_vm_stats/2, {TsStr, <<>>, 0}, VMs),
             {Msg, C};
         false ->
             {[], 0}
     end.
 
 build_vm_stats({NodeKey, {StatsData, MemoryData}}, {TsStr, Acc, C}) ->
-    StatsMsg = lists:map(fun({Key, Val}) ->
-        [
-         "stats.vm.", NodeKey, ".stats.", key2str(Key), " ",
-         io_lib:format("~w", [Val]), " ",
-         TsStr, "\n"
-        ]
-    end, StatsData),
-    MemoryMsg = lists:map(fun({Key, Val}) ->
-        [
-         "stats.vm.", NodeKey, ".memory.", key2str(Key), " ",
-         io_lib:format("~w", [Val]), " ",
-         TsStr, "\n"
-        ]
-    end, MemoryData),
-    NumStats = length(StatsData) + length(MemoryData),
-    Msg = [StatsMsg, MemoryMsg],
-    {TsStr, [Acc, Msg], C + NumStats}.
+    {StatsMsg, StatsCount} = lists:foldl(fun({Key, Val}, {SubAcc, N}) ->
+        KeyStr = key2str(Key),
+        BVal = estatsd_utils:num_to_str(Val),
+        Frag = <<"stats.vm.", NodeKey/binary, ".stats.", KeyStr/binary, " ", BVal/binary, " ", TsStr/binary, "\n">>,
+        {<<SubAcc/binary, Frag/binary>>, N + 1}
+    end, {<<>>, 0}, StatsData),
+    {MemoryMsg, MemCount} = lists:foldl(fun({Key, Val}, {SubAcc, N}) ->
+        KeyStr = key2str(Key),
+        BVal = estatsd_utils:num_to_str(Val),
+        Frag = <<"stats.vm.", NodeKey/binary, ".memory.", KeyStr/binary, " ", BVal/binary, " ", TsStr/binary, "\n">>,
+        {<<SubAcc/binary, Frag/binary>>, N + 1}
+    end, {<<>>, 0}, MemoryData),
+    NumStats = StatsCount + MemCount,
+    {TsStr, <<Acc/binary, StatsMsg/binary, MemoryMsg/binary>>, C + NumStats}.
 
 node_key() ->
     NodeList = atom_to_list(node()),
     {ok, R} = re:compile("[\@\.]"),
-    Opts = [global, {return, list}],
+    Opts = [global, {return, binary}],
     S = re:replace(NodeList,  R, "_", Opts),
     key2str(S).

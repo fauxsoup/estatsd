@@ -5,7 +5,7 @@
 %%                  estatsd instances.
 %% ================================================================
 -module(estatsd_tcp).
--export([send/5]).
+-export([send/6]).
 -export([handle_message/1]).
 -export([make_signature/4]).
 -export([compress/1,decompress/1]).
@@ -14,7 +14,7 @@
         {fun base64:encode/1, fun base64:decode/1}
     ]).
 
-send(Destination, Counters, Timers, Gauges, VMs) ->
+send(Destination, Socket, Counters, Timers, Gauges, VMs) ->
     Message = {[
                 {<<"command">>, <<"aggregate">>},
                 {counters,      {[ counter_to_json(Counter) || Counter <- Counters]}},
@@ -24,7 +24,7 @@ send(Destination, Counters, Timers, Gauges, VMs) ->
                 {signature,     list_to_binary(make_signature(Counters, Timers, Gauges, VMs))}
             ]},
     JSON = jiffy:encode(Message),
-    do_send(Destination, JSON).
+    do_send(Destination, Socket, JSON).
 
 counter_to_json({Key, Value}) ->
     {iolist_to_binary(Key), Value}.
@@ -67,18 +67,11 @@ make_signature(Counters, Timers, Gauges, VM) ->
     Context1 = lists:foldl(fun (Data, ContextAcc) -> crypto:hmac_update(ContextAcc, Data) end, Context0, [ integer_to_list(I) || I <- [length(Counters), length(Timers), length(Gauges), length(VM)] ]),
     estatsd_utils:bin_to_hash(crypto:hmac_final(Context1)).
 
-do_send({estatsd_tcpz, Host, Port}, Message) ->
+do_send({estatsd_tcpz, Host, Port}, Socket, Message) ->
     Compressed = compress(Message),
-    do_send({estatsd_tcp, Host, Port}, Compressed);
-do_send({estatsd_tcp, Host, Port}, Message) ->
-    case gen_tcp:connect(Host, Port, [{active, false}]) of
-        {ok, Socket} ->
-            gen_tcp:send(Socket, [Message, "\n"]),
-            gen_tcp:close(Socket);
-        {error, Reason} ->
-            error_logger:error_msg("Failed to forward statistics to ~w:~w: ~w", [Host, Port, Reason])
-    end,
-    ok.
+    do_send({estatsd_tcp, Host, Port}, Socket, Compressed);
+do_send({estatsd_tcp, _Host, _Port}, Socket, Message) ->
+    gen_tcp:send(Socket, [Message, "\n"]).
 
 compress(Data) when is_list(Data) ->
     compress(iolist_to_binary(Data));
