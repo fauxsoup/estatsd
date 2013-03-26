@@ -42,7 +42,7 @@ start_link() ->
         undefined -> [node()];
         {ok, Peers} -> Peers
     end,
-    gen_leader:start_link(?MODULE, Nodes, [], ?MODULE, [], [{spawn_opt, [{priority, high}]}]).
+    gen_leader:start_link(estatsd_server_new, Nodes, [], ?MODULE, [], [{spawn_opt, [{priority, high}]}]).
 
 %%
 

@@ -10,7 +10,7 @@
          timing_call/3, timing_call/4, timing_call/5
         ]).
 
--define(SERVER, estatsd_server).
+-define(SERVER, estatsd_server_new).
 
 %% @doc Calculates the offset from StartTime and adds it to graphite
 %% as a timing. Pure duration can also be sent.
@@ -22,7 +22,7 @@ aggregate(Counters, Timers, Gauges) ->
     aggregate(Counters, Timers, Gauges, []).
 
 aggregate(Counters, Timers, Gauges, VM) ->
-    gen_leader:leader_cast(estatsd_server, {aggregate, Counters, Timers, Gauges, VM}).
+    gen_leader:leader_cast(estatsd_server_new, {aggregate, Counters, Timers, Gauges, VM}).
     
 timing(Key, StartTime = {_,_,_}) ->
     Dur = erlang:round(timer:now_diff(os:timestamp(), StartTime)/1000),
