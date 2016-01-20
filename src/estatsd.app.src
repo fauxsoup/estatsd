@@ -7,7 +7,8 @@
                   kernel,
                   stdlib,
                   ranch,
-                  ibrowse
+                  ibrowse,
+                  gen_leader
                  ]},
   {mod, { estatsd_app, []}},
   {env, []}
